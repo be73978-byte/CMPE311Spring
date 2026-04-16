@@ -1,0 +1,202 @@
+/*
+  Project #3
+  Platform: Elegoo/Arduino UNO R3 (ATmega328P)
+  Serial Monitor: 9600 baud
+
+
+#include <Arduino.h>
+
+// ----------------------------- Pins -----------------------------
+static const uint8_t LED_PIN_1 = 2;   // LED1 on D2
+static const uint8_t LED_PIN_2 = 3;   // LED2 on D3
+
+// ----------------------------- Timing Model ---------------------
+// The "period" is the full blink period in milliseconds.
+// Each LED toggles every halfPeriod = max(1, period/2).
+// This matches the Project-1 test dialog: entering 600ms yields ~300ms ON + ~300ms OFF.
+
+static volatile unsigned long periodMs_LED1 = 1000;  // default 1s period
+static volatile unsigned long periodMs_LED2 = 1000;  // default 1s period
+
+// Internal toggling state
+static unsigned long lastToggle_LED1 = 0;
+static unsigned long lastToggle_LED2 = 0;
+static bool state_LED1 = LOW;
+static bool state_LED2 = LOW;
+
+// ----------------------------- Serial UI State ------------------
+// Non-blocking line input buffer
+static const size_t LINE_MAX = 32;
+static char lineBuf[LINE_MAX];
+static size_t lineLen = 0;
+
+enum InputState : uint8_t {
+  ASK_LED = 0,
+  ASK_INTERVAL = 1
+};
+
+static InputState uiState = ASK_LED;
+static int selectedLED = -1; // 1 or 2 after a valid LED entry
+
+// ----------------------------- Helpers --------------------------
+static inline unsigned long halfPeriodClamp(unsigned long period) {
+  // Ensure at least 1 ms half-period to avoid zero-interval edge cases.
+  unsigned long hp = period / 2;
+  return (hp == 0 ? 1UL : hp);
+}
+
+static void promptAskLED() {
+  Serial.println(F("What LED? (1 or 2)"));
+}
+
+static void promptAskInterval() {
+  Serial.println(F("What interval (in msec)?"));
+}
+
+static bool isAllDigits(const char* s) {
+  if (!s || !*s) return false;
+  for (const char* p = s; *p; ++p) {
+    if (*p < '0' || *p > '9') return false;
+  }
+  return true;
+}
+
+// Process a completed input line (no CR/LF included).
+static void processLine(const char* line) {
+  switch (uiState) {
+    case ASK_LED: {
+      if ((strcmp(line, "1") == 0) || (strcmp(line, "2") == 0)) {
+        selectedLED = atoi(line);
+        uiState = ASK_INTERVAL;
+        promptAskInterval();
+      } else {
+        Serial.println(F("Invalid LED. Enter 1 or 2."));
+        promptAskLED();
+      }
+    } break;
+
+    case ASK_INTERVAL: {
+      if (!isAllDigits(line)) {
+        Serial.println(F("Invalid interval. Must be a positive integer in milliseconds."));
+        promptAskInterval();
+        return;
+      }
+      // Parse and clamp (0 is invalid)
+      unsigned long val = strtoul(line, nullptr, 10);
+      if (val == 0) {
+        Serial.println(F("Invalid interval. Must be > 0."));
+        promptAskInterval();
+        return;
+      }
+
+      if (selectedLED == 1) {
+        periodMs_LED1 = val;
+        Serial.print(F("LED1 period set to "));
+        Serial.print(periodMs_LED1);
+        Serial.println(F(" ms (ON/OFF ~half each)."));
+      } else if (selectedLED == 2) {
+        periodMs_LED2 = val;
+        Serial.print(F("LED2 period set to "));
+        Serial.print(periodMs_LED2);
+        Serial.println(F(" ms (ON/OFF ~half each)."));
+      } else {
+        // Should never happen; reset UI gracefully
+        Serial.println(F("Internal state error; resetting prompt."));
+      }
+
+      // Reset for next cycle
+      uiState = ASK_LED;
+      selectedLED = -1;
+      promptAskLED();
+    } break;
+  }
+}
+
+// ----------------------------- Tasks ----------------------------
+// Task 1: Non-blocking serial input reader + UI state machine.
+// - Accumulates characters only when available.
+// - Handles Backspace/Delete, ignores CR, ends lines on LF.
+// - Never blocks; safe inside cyclic executive.
+void taskSerialInput(void) {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') {
+      // Ignore CR; wait for LF to terminate line
+      continue;
+    } else if (c == '\n') {
+      // End of line -> process
+      lineBuf[lineLen] = '\0';
+      if (lineLen > 0) {
+        processLine(lineBuf);
+      }
+      lineLen = 0; // reset buffer
+    } else if (c == 8 || c == 127) { // Backspace or Delete
+      if (lineLen > 0) {
+        lineLen--;
+      }
+    } else {
+      // Accept visible characters up to buffer limit
+      if (lineLen < (LINE_MAX - 1)) {
+        lineBuf[lineLen++] = c;
+      }
+      // else: silently drop extra chars to remain non-blocking
+    }
+  }
+}
+
+// Task 2: Blink LED1 according to its configured period.
+void taskBlinkLED1(void) {
+  unsigned long now = millis();
+  unsigned long hp = halfPeriodClamp(periodMs_LED1);
+  if ((now - lastToggle_LED1) >= hp) {
+    state_LED1 = !state_LED1;
+    digitalWrite(LED_PIN_1, state_LED1 ? HIGH : LOW);
+    lastToggle_LED1 = now;
+  }
+}
+
+// Task 3: Blink LED2 according to its configured period.
+void taskBlinkLED2(void) {
+  unsigned long now = millis();
+  unsigned long hp = halfPeriodClamp(periodMs_LED2);
+  if ((now - lastToggle_LED2) >= hp) {
+    state_LED2 = !state_LED2;
+    digitalWrite(LED_PIN_2, state_LED2 ? HIGH : LOW);
+    lastToggle_LED2 = now;
+  }
+}
+
+// ----------------------- Cyclic Executive -----------------------
+typedef void (*TaskFunc)(void);
+
+// Round-robin task list (order can be adjusted)
+TaskFunc taskList[] = {
+  taskSerialInput,
+  taskBlinkLED1,
+  taskBlinkLED2
+};
+
+static const int NUM_TASKS = (int)(sizeof(taskList) / sizeof(taskList[0]));
+
+void setup() {
+  pinMode(LED_PIN_1, OUTPUT);
+  pinMode(LED_PIN_2, OUTPUT);
+
+  digitalWrite(LED_PIN_1, LOW);
+  digitalWrite(LED_PIN_2, LOW);
+
+  Serial.begin(9600);
+  while (!Serial) { /* wait for native USB; UNO returns immediately */ }
+
+  Serial.println(F("System ready (Cyclic Executive)."));
+  promptAskLED();
+}
+
+void loop() {
+  // Non-preemptive round-robin dispatcher
+  for (int i = 0; i < NUM_TASKS; ++i) {
+    taskList[i]();
+  }
+  // No delay(); fast polling keeps everything responsive.
+}
