@@ -1,0 +1,369 @@
+// this is project 4 code!
+
+#include <Arduino.h>
+#include <Arduino_FreeRTOS.h>
+#include <semphr.h>
+
+// ----------------------------- Pins -----------------------------
+
+static const uint8_t LED_PIN_1  = 2;  // LED1 on D2
+static const uint8_t LED_PIN_2  = 3;  // LED2 on D3
+static const uint8_t PWM_PIN    = 9;  // Timer2 PWM output driving MOSFET gate
+static const uint8_t BUTTON_PIN = 4;  // Pushbutton, active LOW (INPUT_PULLUP)
+
+// ----------------------------- Timing Model ---------------------
+// (Copied from Project #2/#4 for LED blinking behavior)
+
+static volatile unsigned long periodMs_LED1 = 1000;  // default 1s period
+static volatile unsigned long periodMs_LED2 = 1000;  // default 1s period
+
+static unsigned long lastToggle_LED1 = 0;
+static unsigned long lastToggle_LED2 = 0;
+
+static bool state_LED1 = LOW;
+static bool state_LED2 = LOW;
+
+// ----------------------------- Serial UI State ------------------
+
+static const size_t LINE_MAX = 32;
+static char   lineBuf[LINE_MAX];
+static size_t lineLen = 0;
+
+enum InputState : uint8_t {
+  ASK_LED = 0,
+  ASK_INTERVAL = 1
+};
+
+static InputState uiState = ASK_LED;
+static int        selectedLED = -1; // 1 or 2 after a valid LED entry
+
+// ----------------------------- Helpers --------------------------
+
+static inline unsigned long halfPeriodClamp(unsigned long period) {
+  unsigned long hp = period / 2;
+  return (hp == 0 ? 1UL : hp);
+}
+
+static void promptAskLED() {
+  Serial.println(F("What LED? (1 or 2)"));
+}
+
+static void promptAskInterval() {
+  Serial.println(F("What interval (in msec)?"));
+}
+
+static bool isAllDigits(const char* s) {
+  if (!s || !*s) return false;
+  for (const char* p = s; *p; ++p) {
+    if (*p < '0' || *p > '9') return false;
+  }
+  return true;
+}
+
+// Process a completed input line (no CR/LF included).
+static void processLine(const char* line) {
+  switch (uiState) {
+    case ASK_LED: {
+      if ((strcmp(line, "1") == 0) || (strcmp(line, "2") == 0)) {
+        selectedLED = atoi(line);
+        uiState = ASK_INTERVAL;
+        promptAskInterval();
+      } else {
+        Serial.println(F("Invalid LED. Enter 1 or 2."));
+        promptAskLED();
+      }
+    } break;
+
+    case ASK_INTERVAL: {
+      if (!isAllDigits(line)) {
+        Serial.println(F("Invalid interval. Must be a positive integer in milliseconds."));
+        promptAskInterval();
+        return;
+      }
+
+      unsigned long val = strtoul(line, nullptr, 10);
+      if (val == 0) {
+        Serial.println(F("Invalid interval. Must be > 0."));
+        promptAskInterval();
+        return;
+      }
+
+      if (selectedLED == 1) {
+        periodMs_LED1 = val;
+        Serial.print(F("LED1 period set to "));
+        Serial.print(periodMs_LED1);
+        Serial.println(F(" ms (ON/OFF ~half each)."));
+      } else if (selectedLED == 2) {
+        periodMs_LED2 = val;
+        Serial.print(F("LED2 period set to "));
+        Serial.print(periodMs_LED2);
+        Serial.println(F(" ms (ON/OFF ~half each)."));
+      } else {
+        Serial.println(F("Internal state error; resetting prompt."));
+      }
+
+      uiState = ASK_LED;
+      selectedLED = -1;
+      promptAskLED();
+    } break;
+  }
+}
+
+// ----------------------------- PWM / Timer2 ---------------------
+
+// 8-slot PWM: each TIMER2 COMPA tick occurs at 2 kHz.
+// 8 ticks per PWM frame → 250 Hz PWM frequency. :contentReference[oaicite:15]{index=15}
+static const uint8_t PWM_MAX_TICKS = 8;
+
+// Number of "ON" ticks per frame, 0..8. Written by motor-duty task, read by ISR.
+volatile uint8_t g_pwmOnTicks = 0;
+
+// Set up Timer2 in CTC mode with OCR2A = 124 and prescaler 64 to get 2 kHz.
+static void setupTimer2PWM() {
+  cli();
+
+  pinMode(PWM_PIN, OUTPUT);
+  digitalWrite(PWM_PIN, LOW);
+
+  // Clear control registers
+  TCCR2A = 0;
+  TCCR2B = 0;
+
+  // CTC mode: WGM21 = 1, WGM20 = 0, WGM22 = 0 → Mode 2
+  TCCR2A |= (1 << WGM21);
+
+  // Compare value: (16 MHz / (64 * 2000 Hz)) - 1 = 124
+  OCR2A = 124;
+
+  // Enable Compare Match A interrupt
+  TIMSK2 |= (1 << OCIE2A);
+
+  // Prescaler = 64 → CS22=1, CS21=0, CS20=1
+  TCCR2B |= (1 << CS22) | (1 << CS20);
+
+  sei();
+}
+
+// Timer2 Compare Match A ISR: generate PWM on D9 using 8-slot frame.
+ISR(TIMER2_COMPA_vect) {
+  static uint8_t s_pwmCounter = 0;
+
+  s_pwmCounter++;
+  if (s_pwmCounter >= PWM_MAX_TICKS) {
+    s_pwmCounter = 0;
+  }
+
+  uint8_t onTicks = g_pwmOnTicks; // 0..8
+
+  if (s_pwmCounter < onTicks) {
+    digitalWrite(PWM_PIN, HIGH);
+  } else {
+    digitalWrite(PWM_PIN, LOW);
+  }
+}
+
+// ----------------------------- FreeRTOS: Button & Motor --------
+
+// Duty pattern copied from Project #4 spec: 0/8 → 2/8 → 4/8 → 6/8 → 8/8 → 6/8 → 4/8 → 2/8 → 0/8. :contentReference[oaicite:16]{index=16}
+static const uint8_t DUTY_TABLE_LEN = 9;
+static const uint8_t dutyTable[DUTY_TABLE_LEN] = {0, 2, 4, 6, 8, 6, 4, 2, 0};
+
+static uint8_t g_dutyIndex = 0;  // index into dutyTable
+
+// Binary semaphore shared between button task and motor-duty task
+static SemaphoreHandle_t xButtonPressSem = NULL;
+
+// Button polling parameters
+static const TickType_t BUTTON_TASK_PERIOD = pdMS_TO_TICKS(5); // 5 ms poll
+static const uint8_t    DEBOUNCE_COUNT    = 4;                 // 4*5 ms = 20 ms
+
+// ----------------------------- Legacy Tasks (now wrapped) ------
+
+// Task 1: Non-blocking serial input reader + UI state machine.
+static void taskSerialInput(void) {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') {
+      continue; // ignore CR, wait for LF
+    } else if (c == '\n') {
+      lineBuf[lineLen] = '\0';
+      if (lineLen > 0) {
+        processLine(lineBuf);
+      }
+      lineLen = 0;
+    } else if (c == 8 || c == 127) { // Backspace or Delete
+      if (lineLen > 0) {
+        lineLen--;
+      }
+    } else {
+      if (lineLen < (LINE_MAX - 1)) {
+        lineBuf[lineLen++] = c;
+      }
+      // else: silently drop extra chars
+    }
+  }
+}
+
+// Task 2: Blink LED1 according to its configured period.
+static void taskBlinkLED1(void) {
+  unsigned long now = millis();
+  unsigned long hp  = halfPeriodClamp(periodMs_LED1);
+
+  if ((now - lastToggle_LED1) >= hp) {
+    state_LED1 = !state_LED1;
+    digitalWrite(LED_PIN_1, state_LED1 ? HIGH : LOW);
+    lastToggle_LED1 = now;
+  }
+}
+
+// Task 3: Blink LED2 according to its configured period.
+static void taskBlinkLED2(void) {
+  unsigned long now = millis();
+  unsigned long hp  = halfPeriodClamp(periodMs_LED2);
+
+  if ((now - lastToggle_LED2) >= hp) {
+    state_LED2 = !state_LED2;
+    digitalWrite(LED_PIN_2, state_LED2 ? HIGH : LOW);
+    lastToggle_LED2 = now;
+  }
+}
+
+// ----------------------------- FreeRTOS Task Wrappers ----------
+
+// FreeRTOS task: serial input
+static void vTaskSerialInput(void* pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    taskSerialInput();
+    vTaskDelay(pdMS_TO_TICKS(1)); // yield frequently
+  }
+}
+
+// FreeRTOS task: LED1 blinker
+static void vTaskBlinkLED1(void* pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    taskBlinkLED1();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// FreeRTOS task: LED2 blinker
+static void vTaskBlinkLED2(void* pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    taskBlinkLED2();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// FreeRTOS task: Button debouncer and event generator
+static void vTaskButton(void* pvParameters) {
+  (void) pvParameters;
+
+  bool lastRaw       = false;
+  bool debounced     = false;
+  bool lastDebounced = false;
+  uint8_t stableCnt  = 0;
+
+  for (;;) {
+    bool rawPressed = (digitalRead(BUTTON_PIN) == LOW); // active LOW
+
+    if (rawPressed == lastRaw) {
+      if (stableCnt < 255) stableCnt++;
+    } else {
+      stableCnt = 0;
+      lastRaw   = rawPressed;
+    }
+
+    if (stableCnt >= DEBOUNCE_COUNT && rawPressed != debounced) {
+      debounced = rawPressed;
+
+      // Rising edge of a debounced press (released -> pressed):
+      if (debounced && !lastDebounced) {
+        // Signal a button-press event via semaphore
+        xSemaphoreGive(xButtonPressSem);
+      }
+
+      lastDebounced = debounced;
+    }
+
+    vTaskDelay(BUTTON_TASK_PERIOD);
+  }
+}
+
+// FreeRTOS task: Motor duty-cycle state machine
+static void vTaskMotorDuty(void* pvParameters) {
+  (void) pvParameters;
+
+  // Initialize to first duty entry (index 0 → 0/8 → motor off)
+  g_dutyIndex   = 0;
+  g_pwmOnTicks  = dutyTable[g_dutyIndex];
+
+  Serial.print(F("Initial duty: "));
+  Serial.print(dutyTable[g_dutyIndex]);
+  Serial.println(F("/8"));
+
+  for (;;) {
+    // Block until a debounced button press event occurs
+    if (xSemaphoreTake(xButtonPressSem, portMAX_DELAY) == pdTRUE) {
+      // Advance through the duty pattern
+      g_dutyIndex++;
+      if (g_dutyIndex >= DUTY_TABLE_LEN) {
+        g_dutyIndex = 0;
+      }
+
+      g_pwmOnTicks = dutyTable[g_dutyIndex];
+
+      Serial.print(F("Button press -> duty "));
+      Serial.print(dutyTable[g_dutyIndex]);
+      Serial.println(F("/8"));
+    }
+  }
+}
+
+// ----------------------------- Arduino setup/loop --------------
+
+void setup() {
+  pinMode(LED_PIN_1, OUTPUT);
+  pinMode(LED_PIN_2, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(LED_PIN_1, LOW);
+  digitalWrite(LED_PIN_2, LOW);
+
+  Serial.begin(9600);
+  while (!Serial) { /* UNO returns immediately; placeholder for compatibility */ }
+
+  Serial.println(F("System ready (FreeRTOS)."));
+  promptAskLED();
+
+  // Configure PWM on D9 via Timer2 ISR
+  setupTimer2PWM();
+
+  // Create semaphore for button press events
+  xButtonPressSem = xSemaphoreCreateBinary();
+  if (xButtonPressSem == NULL) {
+    Serial.println(F("ERROR: Failed to create button semaphore."));
+  }
+
+  // Create FreeRTOS tasks
+  xTaskCreate(vTaskSerialInput, "SerialIn",
+              256, NULL, 2, NULL);
+  xTaskCreate(vTaskBlinkLED1, "LED1",
+              128, NULL, 1, NULL);
+  xTaskCreate(vTaskBlinkLED2, "LED2",
+              128, NULL, 1, NULL);
+  xTaskCreate(vTaskButton, "Button",
+              128, NULL, 3, NULL);   // higher priority to capture presses
+  xTaskCreate(vTaskMotorDuty, "Motor",
+              128, NULL, 2, NULL);
+
+  // The FreeRTOS scheduler is started by the Arduino_FreeRTOS core
+  // after setup() returns, so loop() is left empty.
+}
+
+void loop() {
+  // Not used; all work is done in FreeRTOS tasks.
+}
