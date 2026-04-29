@@ -4,10 +4,8 @@ const int led2Pin = 7;
 
 bool led1State = LOW;
 bool led2State = LOW;
-
 unsigned long previousMillis1 = 0;
 unsigned long previousMillis2 = 0;
-
 unsigned long interval1 = 0;
 unsigned long interval2 = 0;
 
@@ -23,7 +21,6 @@ const int buttonPin = 2;
 const int fanSpeeds[] = {0, 26, 38, 64, 38, 26};
 const int numFanSteps = 6;
 int fanStep = 0;
-
 bool lastButtonState = LOW;
 unsigned long lastPressTime = 0;
 const unsigned long debounceDelay = 200;
@@ -45,37 +42,27 @@ void (*taskList[NUM_TASKS])() = {
 
 int currentTask = 0;
 
-
 // SETUP
-
 void setup() {
   pinMode(led1Pin, OUTPUT);
   pinMode(led2Pin, OUTPUT);
   pinMode(fanPin, OUTPUT);
   pinMode(buttonPin, INPUT);
-
   analogWrite(fanPin, 0);
 
   Serial.begin(9600);
   while (!Serial);
-
   Serial.println("Initial state: Button un-pressed");
   Serial.println("Initial state: Fan off");
   Serial.println("");
   Serial.println("What LED? (1 or 2)");
 }
 
-
 // CYCLIC EXEC
-
 void loop() {
   taskList[currentTask]();
   currentTask = (currentTask + 1) % NUM_TASKS;
 }
-
-
-// TASKS
-
 
 // Task 1: Serial Input (non-blocking)
 void Task_Serial() {
@@ -160,6 +147,5 @@ void Task_Fan() {
       }
     }
   }
-
   lastButtonState = reading;
 }
