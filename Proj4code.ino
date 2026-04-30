@@ -1,3 +1,4 @@
+// last changed was the fan speed double check Task_several got weird bug
 #include <Arduino_FreeRTOS.h>
 #include <semphr.h>
 
@@ -123,18 +124,30 @@ void Task_LED2(void *pvParameters) {
 void Task_Fan(void *pvParameters) {
   (void) pvParameters;
   bool lastBtn = LOW;
+  bool debouncing = false;
+  TickType_t debounceStart = 0;
+
   for (;;) {
     bool btn = digitalRead(BTN_PIN);
-    if (btn == HIGH && lastBtn == LOW) {
+
+    if (!debouncing && btn == HIGH && lastBtn == LOW) {
       fanStep = (fanStep + 1) % 6;
       analogWrite(FAN_PIN, fanSpeeds[fanStep]);
+
       if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         Serial.println(fanLabels[fanStep]);
         xSemaphoreGive(xSerialMutex);
       }
-      vTaskDelay(pdMS_TO_TICKS(200));
+
+      debouncing = true;
+      debounceStart = xTaskGetTickCount();
     }
-    lastBtn = btn;
+
+    if (debouncing && (xTaskGetTickCount() - debounceStart) >= pdMS_TO_TICKS(200)) {
+      debouncing = false;
+    }
+
+    lastBtn = btn;               // ← always updated every loop
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
