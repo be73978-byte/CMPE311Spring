@@ -1,4 +1,4 @@
-// last changed was the fan speed double check Task_several got weird bug
+
 #include <Arduino_FreeRTOS.h>
 #include <semphr.h>
 
