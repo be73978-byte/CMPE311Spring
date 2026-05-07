@@ -1,22 +1,19 @@
-// Project 5 - PROJECT-USERTOS
-// EEPROM Data Frames via Counting Semaphore
-// Author: Shaun Lamb, CMPE 311 Spring 2026
-// Date: May 4, 2026
+// Project 5 PROJECT USERTOS EEPROM
 //
 // EEPROM frame demo is triggered by typing 'e' in the serial monitor.
-// This avoids adding a 5th task which overflows the ATmega328P's 2KB RAM.
+// typing r will send the stored data from e after you unplug the connection
 
 #include <Arduino_FreeRTOS.h>
 #include <semphr.h>
 #include <EEPROM.h>
 
-// ─── Pin Definitions ─────────────────────────────────────────────────────────
+// Pin Def
 #define LED1_PIN    8
 #define LED2_PIN    7
 #define FAN_PIN     3
 #define BTN_PIN     2
 
-// ─── EEPROM Frame Configuration ──────────────────────────────────────────────
+//EEPROM Frame Configuration 
 #define FRAME_SIZE  256
 #define NUM_FRAMES  3
 
@@ -24,7 +21,7 @@
 // Payload = bytes 1 through FRAME_SIZE-1
 const int frameAddr[NUM_FRAMES] = {0, 256, 512};
 
-// ─── Shared State ─────────────────────────────────────────────────────────────
+// Shared State 
 volatile unsigned long interval1 = 0;
 volatile unsigned long interval2 = 0;
 
@@ -40,17 +37,13 @@ volatile bool awaitingInterval = false;
 char    inputBuf[16];
 uint8_t inputLen = 0;
 
-// ─── Semaphores ───────────────────────────────────────────────────────────────
 SemaphoreHandle_t xSerialMutex;
 SemaphoreHandle_t xFrameSema;
 
-// ─── Task Prototypes ──────────────────────────────────────────────────────────
 void Task_Serial(void *pvParameters);
 void Task_LED1  (void *pvParameters);
 void Task_LED2  (void *pvParameters);
 void Task_Fan   (void *pvParameters);
-
-// ─── EEPROM Frame API ─────────────────────────────────────────────────────────
 
 void initFrames() {
   for (int i = 0; i < NUM_FRAMES; i++) {
@@ -89,8 +82,7 @@ void readFrame(int idx, uint8_t *buf, uint8_t len) {
   }
 }
 
-// Runs one acquire→write→read→release cycle and prints result.
-// Called from Task_Serial so no extra task stack needed.
+// Runs one acquire to write to read to release cycle and prints the result.
 void runEepromDemo() {
   int frame = acquireFrame();
   if (frame < 0) {
@@ -116,7 +108,7 @@ void runEepromDemo() {
   Serial.println();
 }
 
-// ─── Setup ────────────────────────────────────────────────────────────────────
+//  Setup
 void setup() {
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
@@ -127,8 +119,8 @@ void setup() {
   Serial.begin(9600);
   initFrames();
 
-  // The Uno resets when the serial monitor opens, so we wait for the
-  // user to press Enter before printing startup messages.
+  // The Uno resets when the serial monitor opens, so we wait for 
+  // me to press Enter before printing startup messages idk i had to do this so i don't get bugged and it made it all easier for me
   while (Serial.available() == 0) { ; }
   while (Serial.available() > 0) { Serial.read(); } // flush the trigger byte
 
@@ -149,8 +141,8 @@ void setup() {
 
 void loop() {}
 
-// ─── Task_Serial ──────────────────────────────────────────────────────────────
-// Handles LED selection, interval input, and the 'e' EEPROM demo command.
+// Task_Serial 
+// Handles LED selection, interval input, and the 'e' EEPROM command.
 void Task_Serial(void *pvParameters) {
   (void) pvParameters;
 
@@ -165,9 +157,8 @@ void Task_Serial(void *pvParameters) {
 
           if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
 
-            // ── EEPROM demo command ──────────────────────────────────────────
+            // EEPROM command 
             if (inputBuf[0] == 'r' || inputBuf[0] == 'R') {
-              // Read frame 0 payload directly — no acquire/release needed.
               // Use this after a power cut to prove data survived in EEPROM.
               Serial.print("Frame 0 after power cut: ");
               for (int i = 0; i < 8; i++) {
@@ -183,7 +174,7 @@ void Task_Serial(void *pvParameters) {
               runEepromDemo();
               Serial.println("What LED? (1 or 2)");
 
-            // ── LED / interval flow ──────────────────────────────────────────
+            // LED
             } else {
               int value = atoi(inputBuf);
 
@@ -218,7 +209,7 @@ void Task_Serial(void *pvParameters) {
   }
 }
 
-// ─── LED Blink Helper ─────────────────────────────────────────────────────────
+// LED Blink Helper 
 static void blinkTask(int pin, volatile unsigned long &interval) {
   for (;;) {
     unsigned long iv = interval;
@@ -237,7 +228,7 @@ static void blinkTask(int pin, volatile unsigned long &interval) {
 void Task_LED1(void *pvParameters) { (void)pvParameters; blinkTask(LED1_PIN, interval1); }
 void Task_LED2(void *pvParameters) { (void)pvParameters; blinkTask(LED2_PIN, interval2); }
 
-// ─── Task_Fan ─────────────────────────────────────────────────────────────────
+// Task_Fan
 void Task_Fan(void *pvParameters) {
   (void) pvParameters;
   bool       lastBtn       = LOW;
